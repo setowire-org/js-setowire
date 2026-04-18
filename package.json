@@ -1,0 +1,27 @@
+{
+  "name": "setowire",
+  "version": "0.1.0",
+  "description": "A lightweight, portable P2P networking library built on UDP. No central servers, no brokers — peers find each other and communicate directly.",
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "*.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "p2p",
+    "udp",
+    "networking",
+    "dht",
+    "nat-traversal",
+    "relay",
+    "swarm"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
