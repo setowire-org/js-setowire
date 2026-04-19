@@ -99,6 +99,7 @@ this._meshD         = D_DEFAULT;
 this._payloadCache = new PayloadCache(8192);
 
 this._store       = new LRU(opts.storeCacheMax || SYNC_CACHE_MAX);
+    this._storage     = opts.storage || null;
     this._wantPending = new Map(); 
 
     this._ready = this._init();
@@ -112,14 +113,18 @@ store(key, value) {
     const k = typeof key === 'string' ? key : key.toString('hex');
     const v = Buffer.isBuffer(value) ? value : Buffer.from(value);
     this._store.add(k, v);
+    if (this._storage) this._storage.set(k, v).catch(() => {});
     this._announceHave([k]);
   }
 
-fetch(key, timeout = SYNC_TIMEOUT) {
+async fetch(key, timeout = SYNC_TIMEOUT) {
     const k = typeof key === 'string' ? key : key.toString('hex');
-    const local = this._store.get(k);
-    if (local) return Promise.resolve(local);
-
+    const mem = this._store.get(k);
+    if (mem) return mem;
+    if (this._storage) {
+      const disk = await this._storage.get(k).catch(() => null);
+      if (disk) { this._store.add(k, disk); return disk; }
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._wantPending.delete(k);
@@ -567,7 +572,7 @@ _onData(buf, src) {
     if (!plain) return;
 
     peer._touch(src);
-    peer._onAck();
+  peer._onAck();
     peer._scoreUp();
 
     const msgKey = xorHash(plain);
@@ -760,6 +765,7 @@ _sendHaveSummary(peer) {
       if (o + vlen > buf.length) return;
       const value = buf.slice(o, o + vlen);
       this._store.add(key, value);
+      if (this._storage) this._storage.set(key, value).catch(() => {});
       const pending = this._wantPending.get(key);
       if (pending) {
         clearTimeout(pending.timer);
@@ -786,6 +792,7 @@ _sendHaveSummary(peer) {
         for (let i = 0; i < asm.total; i++) parts.push(asm.pieces.get(i));
         const value = Buffer.concat(parts);
         this._store.add(key, value);
+        if (this._storage) this._storage.set(key, value).catch(() => {});
         const pending = this._wantPending.get(key);
         if (pending) {
           clearTimeout(pending.timer);
@@ -1082,14 +1089,20 @@ _sendHaveSummary(peer) {
   }
 
   _startBootstrapAnnounce() {
-    const doAnnounce = () => {
-      if (this._destroyed) return;
-      this._queryBootstrapHttp();
-    };
+  const doAnnounce = () => {
+    if (this._destroyed) return;
+    this._queryBootstrapHttp();
+  };
+
+  if (this._ext) {
     doAnnounce();
-    const t = setInterval(doAnnounce, 3 * 60 * 1000);
-    this._announcers.push(t);
+  } else {
+    this.once('nat', () => doAnnounce());
   }
+
+  const t = setInterval(doAnnounce, 3 * 60 * 1000);
+  this._announcers.push(t);
+}
 
   _bestRelay() {
     const now = Date.now();
@@ -1232,3 +1245,4 @@ _sendHaveSummary(peer) {
 }
 
 module.exports = Swarm;
+                             
