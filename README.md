@@ -1,4 +1,4 @@
-#Setowire - Javascript
+# Setowire - Javascript
 
 A lightweight, portable P2P networking library built on UDP. No central servers, no brokers — peers find each other and communicate directly.
 
@@ -9,6 +9,14 @@ Built to be simple enough to reimplement in any language.
 ## Why
 
 Most P2P libraries are either too heavy or too tied to a specific runtime. We wanted something small, auditable, and easy to port to Rust, Go, or whatever comes next. The protocol fits in your head.
+
+---
+
+## Install
+
+```bash
+npm install setowire
+```
 
 ---
 
@@ -45,7 +53,7 @@ chat.js        — example terminal chat app
 ## Quick start
 
 ```js
-const Swarm  = require('./index');
+const Swarm  = require('setowire');
 const crypto = require('crypto');
 
 const swarm = new Swarm();
@@ -75,6 +83,10 @@ swarm.on('data', (data, peer) => {
 | `relay` | false | force relay mode regardless of NAT |
 | `bootstrap` | [] | `["host:port"]` bootstrap nodes |
 | `seeds` | [] | additional hardcoded seed peers |
+| `storage` | null | pluggable storage backend (see [Persistent storage](#persistent-storage)) |
+| `storeCacheMax` | 10000 | max entries kept in the in-memory cache |
+| `onSavePeers` | null | `(peers) => {}` called when the peer cache is updated |
+| `onLoadPeers` | null | `() => peers` called on startup to restore known peers |
 
 ### `swarm.join(topic, opts?)`
 
@@ -88,11 +100,17 @@ Send data to all connected peers. Returns number of peers reached.
 
 ### `swarm.store(key, value)`
 
-Store a value locally and announce it to the mesh.
+Store a value in the local cache, persist it to the storage backend if one is set, and announce to the mesh that you have it.
 
 ### `swarm.fetch(key, timeout?)`
 
-Fetch a value — returns local copy immediately or pulls from the network.
+Fetch a value. Lookup order:
+
+1. In-memory cache
+2. Storage backend (if set)
+3. Network — sends a WANT to the mesh and waits up to `timeout` ms (default 30s)
+
+Returns a `Promise<Buffer>`.
 
 ### `swarm.destroy()`
 
@@ -107,6 +125,79 @@ Graceful shutdown. Notifies peers and closes the socket.
 | `disconnect` | `peerId` | peer dropped |
 | `sync` | `key, value` | value received from network |
 | `nat` | — | public address discovered |
+
+---
+
+## Persistent storage
+
+By default, `store()` and `fetch()` only use an in-memory LRU cache — data is lost when the process exits.
+
+To persist data across restarts, pass a `storage` object with `get` and `set` methods:
+
+```js
+const swarm = new Swarm({ storage: myBackend });
+```
+
+The backend must implement:
+
+```ts
+{
+  get(key: string): Promise<Buffer | null>
+  set(key: string, value: Buffer): Promise<void>
+}
+```
+
+Any async key-value store works. Examples:
+
+**LevelDB**
+```js
+const { Level } = require('level');
+const db = new Level('./data', { valueEncoding: 'buffer' });
+
+const swarm = new Swarm({
+  storage: {
+    get: (k) => db.get(k).catch(() => null),
+    set: (k, v) => db.put(k, v),
+  }
+});
+```
+
+**SQLite (via better-sqlite3)**
+```js
+const Database = require('better-sqlite3');
+const db = new Database('data.db');
+db.exec('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v BLOB)');
+
+const swarm = new Swarm({
+  storage: {
+    get: async (k) => {
+      const row = db.prepare('SELECT v FROM kv WHERE k = ?').get(k);
+      return row ? row.v : null;
+    },
+    set: async (k, v) => {
+      db.prepare('INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)').run(k, v);
+    },
+  }
+});
+```
+
+**Plain JSON file (simple, not for large data)**
+```js
+const fs   = require('fs');
+const PATH = './store.json';
+
+const load = () => { try { return JSON.parse(fs.readFileSync(PATH)); } catch { return {}; } };
+const save = (data) => fs.writeFileSync(PATH, JSON.stringify(data));
+
+const swarm = new Swarm({
+  storage: {
+    get:  async (k)    => { const d = load(); return d[k] ? Buffer.from(d[k], 'hex') : null; },
+    set:  async (k, v) => { const d = load(); d[k] = v.toString('hex'); save(d); },
+  }
+});
+```
+
+If no `storage` is provided, the library works fine — values that aren't in memory will be fetched from the network instead.
 
 ---
 
@@ -155,4 +246,10 @@ node chat.js alice myroom
 ```
 
 Commands: `/peers`, `/nat`, `/quit`
+
+---
+
+## License
+
+MIT
 
