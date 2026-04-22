@@ -105,6 +105,7 @@ const F_HAVE   = 0x10;
 const F_WANT   = 0x11;
 const F_CHUNK  = 0x12;
 const F_BATCH  = 0x13;
+const F_CHUNK_ACK = 0x14;
 
 const MCAST_ADDR = '239.0.0.1';
 const MCAST_PORT = 45678;
@@ -133,6 +134,7 @@ module.exports = {
   DRAIN_TIMEOUT, STUN_FAST_TIMEOUT,
   TAG_LEN, NONCE_LEN,
   F_DATA, F_PING, F_PONG, F_FRAG, F_GOAWAY,
-  F_HAVE, F_WANT, F_CHUNK, F_BATCH,
+  F_HAVE, F_WANT, F_CHUNK, F_BATCH, F_CHUNK_ACK,
   MCAST_ADDR, MCAST_PORT, F_LAN,
 };
+

@@ -26,6 +26,7 @@ const {
   DRAIN_TIMEOUT,
   F_DATA, F_PING, F_PONG, F_FRAG, F_GOAWAY,
   F_HAVE, F_WANT, F_CHUNK, F_BATCH,
+  F_CHUNK_ACK,
   MCAST_ADDR, MCAST_PORT, F_LAN,
   RTT_ALPHA,
 } = require('./constants');
@@ -461,6 +462,7 @@ _recv(buf, r) {
     if (type === F_HAVE)      return this._onHave(buf, src);
     if (type === F_WANT)      return this._onWant(buf, src);
     if (type === F_CHUNK)     return this._onChunk(buf, src);
+    if (type === F_CHUNK_ACK) return this._onChunkAck(buf, src);
     if (type === F_RELAY_ANN) return this._onRelayAnn(buf, src);
     if (type === F_RELAY_REQ) return this._onRelayReq(buf, src);
     if (type === F_RELAY_FWD) return this._onRelayFwd(buf, src);
@@ -572,7 +574,7 @@ _onData(buf, src) {
     if (!plain) return;
 
     peer._touch(src);
-  peer._onAck();
+    peer._onAck();
     peer._scoreUp();
 
     const msgKey = xorHash(plain);
@@ -680,7 +682,8 @@ _sendHaveSummary(peer) {
     msg[0] = F_WANT;
     msg[1] = kb.length;
     kb.copy(msg, 2);
-    for (const peer of this.meshPeers) {
+    const targets = this.meshPeers.length > 0 ? this.meshPeers : this.peers;
+    for (const peer of targets) {
       if (peer._session && peer._open) peer.writeCtrl(msg);
     }
   }
@@ -723,8 +726,8 @@ _sendHaveSummary(peer) {
     if (!value) return;
 
     const kb = Buffer.from(key);
+
     if (value.length <= SYNC_CHUNK_SIZE) {
-      
       const msg = Buffer.allocUnsafe(1 + 1 + kb.length + 2 + value.length);
       let o = 0;
       msg[o++] = F_CHUNK;
@@ -733,23 +736,75 @@ _sendHaveSummary(peer) {
       msg.writeUInt16BE(value.length, o); o += 2;
       value.copy(msg, o);
       peer.writeCtrl(msg);
-    } else {
-      
-      const total = Math.ceil(value.length / SYNC_CHUNK_SIZE);
-      for (let i = 0; i < total; i++) {
-        const chunk = value.slice(i * SYNC_CHUNK_SIZE, Math.min((i + 1) * SYNC_CHUNK_SIZE, value.length));
-        const msg   = Buffer.allocUnsafe(1 + 1 + kb.length + 2 + 2 + 2 + chunk.length);
-        let o = 0;
-        msg[o++] = F_CHUNK;
-        msg[o++] = kb.length;
-        kb.copy(msg, o); o += kb.length;
-        msg.writeUInt16BE(0xFFFF, o); o += 2; 
-        msg.writeUInt16BE(i, o); o += 2;
-        msg.writeUInt16BE(total, o); o += 2;
-        chunk.copy(msg, o);
-        peer.writeCtrl(msg);
-      }
+      return;
     }
+
+    const total      = Math.ceil(value.length / SYNC_CHUNK_SIZE);
+    const [ip, port] = peer._best.split(':');
+    const WINDOW     = 8;
+    const RTO_MS     = 1500;
+
+    const txKey = `${key}:${pid}`;
+    if (!this._reliableTx) this._reliableTx = new Map();
+    if (this._reliableTx.has(txKey)) return;
+
+    const acked  = new Uint8Array(total);
+    const timers = new Array(total);
+    const tx     = { acked, timers, done: false };
+    this._reliableTx.set(txKey, tx);
+
+    const cleanup = () => {
+      tx.done = true;
+      timers.forEach(t => clearTimeout(t));
+      this._reliableTx.delete(txKey);
+    };
+    setTimeout(cleanup, 60000);
+
+    const sendFrame = (i) => {
+      if (tx.done || acked[i]) return;
+      const chunk = value.slice(i * SYNC_CHUNK_SIZE, Math.min((i + 1) * SYNC_CHUNK_SIZE, value.length));
+      const msg   = Buffer.allocUnsafe(1 + 1 + kb.length + 2 + 2 + 2 + chunk.length);
+      let o = 0;
+      msg[o++] = F_CHUNK;
+      msg[o++] = kb.length;
+      kb.copy(msg, o); o += kb.length;
+      msg.writeUInt16BE(0xFFFF, o); o += 2;
+      msg.writeUInt16BE(i, o); o += 2;
+      msg.writeUInt16BE(total, o); o += 2;
+      chunk.copy(msg, o);
+      try { this._batch.send(ip, port, msg); } catch {}
+      clearTimeout(timers[i]);
+      timers[i] = setTimeout(() => { if (!tx.done && !acked[i]) sendFrame(i); }, RTO_MS);
+    };
+
+    tx.onAck = (idx) => {
+      acked[idx] = 1;
+      clearTimeout(timers[idx]);
+      if (acked.every((v, i) => i >= total || v)) { cleanup(); return; }
+      for (let i = 0; i < total; i++) {
+        if (!acked[i] && !timers[i]) { sendFrame(i); break; }
+      }
+    };
+
+    let sent = 0;
+    for (let i = 0; i < total && sent < WINDOW; i++) {
+      sendFrame(i);
+      sent++;
+    }
+  }
+
+  _onChunkAck(buf, src) {
+    if (buf.length < 5) return;
+    let o = 1;
+    const klen = buf[o++];
+    if (o + klen + 2 > buf.length) return;
+    const key = buf.slice(o, o + klen).toString(); o += klen;
+    const idx = buf.readUInt16BE(o);
+    const pid = this._addrToId.get(src);
+    if (!pid) return;
+    const tx = this._reliableTx?.get(`${key}:${pid}`);
+    if (!tx || tx.done) return;
+    tx.onAck(idx);
   }
 
   _onChunk(buf, src) {
@@ -778,6 +833,21 @@ _sendHaveSummary(peer) {
       const idx   = buf.readUInt16BE(o); o += 2;
       const total = buf.readUInt16BE(o); o += 2;
       const data  = buf.slice(o);
+
+      const kb2  = Buffer.from(key);
+      const ack  = Buffer.allocUnsafe(1 + 1 + kb2.length + 2);
+      let ao = 0;
+      ack[ao++] = F_CHUNK_ACK;
+      ack[ao++] = kb2.length;
+      kb2.copy(ack, ao); ao += kb2.length;
+      ack.writeUInt16BE(idx, ao);
+      const pid2 = this._addrToId.get(src);
+      const peer2 = pid2 ? this._peers.get(pid2) : null;
+      if (peer2) {
+        const [ip2, port2] = peer2._best.split(':');
+        try { this._batch.send(ip2, port2, ack); } catch {}
+      }
+
       if (!this._chunkAssembly) this._chunkAssembly = new Map();
       let asm = this._chunkAssembly.get(key);
       if (!asm) {
@@ -1245,4 +1315,4 @@ _sendHaveSummary(peer) {
 }
 
 module.exports = Swarm;
-                             
+
