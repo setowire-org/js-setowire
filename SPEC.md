@@ -28,7 +28,7 @@ graph TB
         DISCOVERY[Discovery Engine]
         MESH[Mesh Manager]
         RELAY[Relay Service]
-        CACHE[Cache / Storage]
+        CACHE[Key-Value Cache]
     end
 
     subgraph "Network Abstraction"
@@ -52,6 +52,7 @@ graph TB
         DHT[DHT Protocol]
         PEX[Peer Exchange]
         LAN[LAN Multicast]
+        PIPING[HTTP Piping Servers]
         HTTP[HTTP Bootstrap]
     end
 
@@ -64,6 +65,7 @@ graph TB
     DISCOVERY --> DHT
     DISCOVERY --> PEX
     DISCOVERY --> LAN
+    DISCOVERY --> PIPING
     DISCOVERY --> HTTP
     DISCOVERY --> STUN
     
@@ -89,7 +91,7 @@ graph TB
 | **Cryptography** | `crypto.js` | Key exchange, encryption, decryption |
 | **DHT** | `dht_lib.js` | Decentralized topic discovery |
 | **Framing** | `framing.js` | Fragmentation, batching, jitter buffer |
-| **Structures** | `structs.js` | Bloom filter, LRU, ring buffer |
+| **Structures** | `structs.js` | Bloom filter, LRU, ring buffer, payload cache |
 | **Constants** | `constants.js` | All tuneable parameters |
 
 ---
@@ -109,6 +111,7 @@ classDiagram
         +SimpleDHT _dht
         +BloomFilter _bloom
         +LRU _store
+        +LRU _gossipSeen
         +Map _relays
         +String natType
         +String publicAddress
@@ -118,6 +121,7 @@ classDiagram
     class Peer {
         +String id
         +String _best
+        +Boolean inMesh
         +Object _session
         +RingBuffer _ctrlQueue
         +RingBuffer _dataQueue
@@ -125,29 +129,79 @@ classDiagram
         +FragmentAssembler _fragger
     }
     
-    class PeerManager {
-        +Swarm swarm
-        +Map~String, Peer~ peers
-    }
-    
-    Swarm *-- "1..*" Peer : manages
-    Swarm --> PeerManager
+    Swarm *-- "0..*" Peer : manages
 ```
 
 ### 3.2 Discovery Pipeline
 
+O discovery acontece em TWO fases distintas:
+
+1. **Constructor (_init)**: LAN multicast, PEX, STUN, peer cache emit - iniciados automaticamente
+2. **join()**: DHT, HTTP Piping, HTTP Bootstrap, Seeds, Peer Cache dial - iniciados após NAT descoberta
+
 ```mermaid
-flowchart LR
-    START[Start Join] --> DHT[DHT]
-    DHT --> PIPING[Piping Servers]
-    PIPING --> LAN[LAN Multicast]
-    LAN --> HTTP[HTTP Bootstrap]
-    HTTP --> CACHE[Peer Cache]
-    CACHE --> SEEDS[Hardcoded Seeds]
-    SEEDS --> ESTABLISHED[Connections Established]
+flowchart TB
+    subgraph "Fase 1: Constructor (_init)"
+        INIT["new Swarm()"]
+
+        INIT --> SOCK["UDP socket bind"]
+
+        SOCK --> LAN["_initLan()"]
+        SOCK --> PEX["_initPex()"]
+        SOCK --> CACHE_EMIT["_initPeerCacheEmit()"]
+        SOCK --> STUN["_stunLazy()"]
+        SOCK --> HTTP_BOOT["_queryBootstrapHttp()"]
+
+        STUN --> NAT_INFO["Detect external IP + NAT type"]
+    end
+
+    subgraph "Fase 2: join(topic)"
+        JOIN["swarm.join(topic, opts)"]
+
+        JOIN --> CHECK_NAT{"NAT/public address known?"}
+
+        CHECK_NAT -->|No| WAIT_NAT["Wait for 'nat' event"]
+        CHECK_NAT -->|Yes| START_DISCOVERY
+
+        WAIT_NAT --> START_DISCOVERY["Start discovery"]
+
+        START_DISCOVERY --> DHT["DHT announce + lookup"]
+        START_DISCOVERY --> PIPING_POST["HTTP Piping POST announce"]
+        START_DISCOVERY --> PIPING_GET["HTTP Piping GET loop"]
+        START_DISCOVERY --> CACHE_DIAL["_dialPeerCache()"]
+        START_DISCOVERY --> SEEDS["_dialHardcodedSeeds()"]
+        START_DISCOVERY --> HTTP_QUERY["_queryBootstrapHttp()"]
+
+        DHT --> MEET["_meet()"]
+        PIPING_GET --> MEET
+        CACHE_DIAL --> MEET
+        SEEDS --> MEET
+        HTTP_QUERY --> MEET
+
+        MEET --> HELLO["HELLO / HELLO_ACK"]
+        HELLO --> SESSION["Derive encrypted session"]
+        SESSION --> CONNECTED["Emit connection event"]
+
+        CONNECTED --> MESH["Participate in mesh"]
+    end
 ```
 
-Discovery strategies run in parallel; whichever succeeds first establishes the connection.
+Fluxo REAL (baseado em swarm.js linhas 139-306):
+
+1. No **`new Swarm()`** → `_init()` (linha 342) inicializa:
+   - `_stunLazy()` - detecta IP externo e NAT
+   - `_initLan()` - multicast UDP para LAN
+   - `_initPex()` - peer exchange interval
+   - `_initPeerCacheEmit()` - cache emit interval
+   - `_queryBootstrapHttp()` - HTTP bootstrap query
+
+2. Em **`swarm.join(topic, opts)`** → após NAT descoberto:
+   - `startDHT()` - announces/lookups no DHT
+   - `_dialPeerCache()` - disca peers em cache
+   - `_dialHardcodedSeeds()` - disca seeds
+   - `_queryBootstrapHttp()` - HTTP bootstrap
+   - `postAll()` - HTTP piping POST (announce)
+   - `pipingGet()` - HTTP piping GET loops (lookup)
 
 ---
 
@@ -160,27 +214,30 @@ Discovery strategies run in parallel; whichever succeeds first establishes the c
 | `0x01` | DATA | Encrypted application data | Bidirectional |
 | `0x03` | PING | Keepalive + RTT measurement | Outbound |
 | `0x04` | PONG | Keepalive reply | Inbound |
+| `0x07` | IHAVE | Gossip: have keys | Outbound |
+| `0x09` | LAN | LAN multicast discovery | Outbound (broadcast) |
 | `0x0A` | GOAWAY | Graceful disconnect | Bidirectional |
 | `0x0B` | FRAG | Fragment of large message | Bidirectional |
+| `0x10` | HAVE | Announce available keys (DHT value) | Outbound |
+| `0x11` | WANT | Request specific key | Outbound |
+| `0x12` | CHUNK | Key value chunk | Bidirectional |
 | `0x13` | BATCH | Multiple frames in one datagram | Bidirectional |
 | `0x14` | CHUNK_ACK | ACK for reliable chunk transfer | Bidirectional |
 | `0x20` | RELAY_ANN | Peer announces as relay | Outbound |
 | `0x21` | RELAY_REQ | Request introduction via relay | Outbound |
 | `0x22` | RELAY_FWD | Relay forwards introduction | Inbound |
 | `0x30` | PEX | Peer exchange | Bidirectional |
-| `0x09` | LAN | LAN multicast discovery | Outbound |
-| `0xA1` | HELLO | Handshake: initial | Outbound |
-| `0xA2` | HELLO_ACK | Handshake: response | Inbound |
-| `0x10` | HAVE | Announce available keys | Outbound |
-| `0x11` | WANT | Request specific key | Outbound |
-| `0x12` | CHUNK | Key value chunk | Bidirectional |
+| `0xA1` | HELLO | Handshake: initial (not encrypted) | Outbound |
+| `0xA2` | HELLO_ACK | Handshake: response (not encrypted) | Inbound |
+
+> **Note**: HELLO (0xA1) and HELLO_ACK (0xA2) are NOT defined in constants.js - they use hardcoded values 0xA1 and 0xA2 directly in the code (swarm.js lines 488, 497).
 
 ### 4.2 Handshake Protocol
 
 ```mermaid
 sequenceDiagram
-    participant A as Peer A
-    participant B as Peer B
+    participant A as Initiator
+    participant B as Receiver
     
     A->>B: HELLO (0xA1)<br/>[ID: 8 bytes][PubKey: 32 bytes]
     B-->>A: HELLO_ACK (0xA2)<br/>[ID: 8 bytes][PubKey: 32 bytes]
@@ -193,9 +250,11 @@ sequenceDiagram
     B->>A: DATA (encrypted)<br/>[ChaCha20-Poly1305]
 ```
 
-The handshake uses X25519 key exchange. Both peers derive session keys using HKDF-SHA256 with label `p2p-v12-session`. The peer with the lexicographically lower ID uses the first 32 bytes as send key; the other peer flips them.
+The handshake uses X25519 key exchange (NOT in constants - defined inline). Both peers derive session keys using HKDF-SHA256 with label `p2p-v12-session`. The peer with the lexicographically lower ID uses the first 32 bytes as send key; the other peer flips them.
 
-### 4.3 Packet Structure
+### 4.3 Packet Structures
+
+All frames start with 1-byte type:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -203,16 +262,61 @@ The handshake uses X25519 key exchange. Both peers derive session keys using HKD
 └─────────────────────────────────────────────────────────────┘
 ```
 
-```
-HELLO Frame (0xA1):
-┌────────┬──────────────────┬────────────────────────────┐
-│ 0xA1   │ Peer ID (8 bytes)  │ X25519 Public Key (32 bytes)  │
-└────────┴──────────────────┴────────────────────────────┘
+**HELLO Frame (0xA1) - NOT in constants, hardcoded:**
 
-DATA Frame (0x01) - Encrypted:
-┌────────┬─────────────────────────┬──────────────────────────┐
-│ 0x01   │ Nonce (12 bytes)          │ Ciphertext + Tag (28+ N) │
-└────────┴─────────────────────────┴──────────────────────────┘
+```
+Offset  Size     Field                    Notes
+0       1        Frame type (0xA1)
+1       8        Peer ID (hex string, 20 bytes → 8 bytes in frame)
+9       32       X25519 public key (raw)
+Total: 41 bytes
+```
+
+> **CORRECTION**: Peer ID is 20 bytes in `this._id`, but only 8 bytes are sent in the HELLO frame (swarm.js line 486-490: `Buffer.from(this._id, 'hex')` creates a 20-byte buffer, but only 8 bytes are allocated in the frame).
+
+**DATA Frame (0x01) - Encrypted:**
+
+```
+Offset  Size     Field
+0       1        Frame type (0x01)
+1       12       Nonce (4-byte session ID + 8-byte counter)
+13      N        Ciphertext
+13+N    16       Auth tag (Poly1305)
+Total: 13 + N + 16 bytes
+```
+
+**FRAG Frame (0x0B):**
+
+```
+Offset  Size     Field
+0       1        Frame type (0x0B)
+1       8        Fragment ID (random)
+9       2        Fragment index
+11      2        Total fragments
+13      N        Fragment data
+Total: 13 + N bytes
+```
+
+**BATCH Frame (0x13):**
+
+```
+Offset  Size     Field
+0       1        Frame type (0x13)
+1       1        Frame count
+2       2        Frame 1 length (uint16)
+4       L1       Frame 1 data
+4+L1    2        Frame 2 length
+...     ...       ...
+```
+
+**IHAVE Frame (0x07):**
+
+Used for gossip (swarm.js `_emitIhave` line 1269):
+
+```
+Offset  Size     Field
+0       1        Frame type (0x07)
+1       N        Concatenated key hashes (8 bytes each)
 ```
 
 ---
@@ -223,179 +327,281 @@ DATA Frame (0x01) - Encrypted:
 
 ```mermaid
 flowchart TB
-    subgraph "Inbound Pipeline"
-        RECV[UDP Receive] --> DISP[Dispatcher]
-        DISP --> DEC[Decrypt]
-        DEC --> FRAG[Reassemble]
-        FRAG --> JITTER[Jitter Buffer]
-        JITTER --> EMIT[Emit Event]
+
+    subgraph "Outbound Path"
+
+        APP_WRITE["peer.write(data)"]
+
+        APP_WRITE --> DATA_QUEUE["Peer _dataQueue"]
+
+        DATA_QUEUE --> SIZE_CHECK{"Payload > MAX_PAYLOAD?"}
+
+        SIZE_CHECK -->|Yes| FRAGMENT["Create FRAG frames"]
+        SIZE_CHECK -->|No| ENCRYPT["Encrypt DATA frame"]
+
+        FRAGMENT --> ENCRYPT
+
+        ENCRYPT --> NONCE["Build nonce<br/>session_id + counter"]
+
+        NONCE --> CHACHA["ChaCha20-Poly1305"]
+
+        CHACHA --> FRAME["Build DATA frame (0x01)"]
+
+        FRAME --> BATCHER["BatchSender"]
+
+        BATCHER --> UDP_SEND["UDP socket send"]
     end
-    
-    subgraph "Outbound Pipeline"
-        WRITE[App Write] --> QUEUE[Queue]
-        QUEUE --> FRAG2[Fragment if > MTU]
-        FRAG2 --> ENC[Encrypt]
-        ENC --> BATCH[Batch UDP]
-        BATCH --> SEND[UDP Send]
+
+
+    subgraph "Inbound Path"
+
+        UDP_RECV["UDP socket receive"]
+
+        UDP_RECV --> DISPATCH["Frame dispatcher"]
+
+        DISPATCH --> TYPE_CHECK{"Frame type"}
+
+        TYPE_CHECK -->|HELLO/HELLO_ACK| HANDSHAKE["Handshake processing"]
+
+        TYPE_CHECK -->|DATA| DECRYPT["Decrypt frame"]
+
+        TYPE_CHECK -->|FRAG| REASSEMBLE["Fragment assembler"]
+
+        TYPE_CHECK -->|BATCH| UNPACK["Unpack batched frames"]
+
+        UNPACK --> DISPATCH
+
+        HANDSHAKE --> SESSION_CREATE["Create encrypted session"]
+
+        DECRYPT --> AUTH{"Poly1305 valid?"}
+
+        AUTH -->|No| DROP["Drop frame"]
+
+        AUTH -->|Yes| SEQ_CHECK{"Sequenced?"}
+
+        SEQ_CHECK -->|Yes| JITTER["JitterBuffer"]
+
+        SEQ_CHECK -->|No| EMIT_DIRECT["Emit peer/data event"]
+
+        JITTER --> ORDERED["Deliver ordered packets"]
+
+        ORDERED --> EMIT_ORDERED["Emit peer/data event"]
+
+        REASSEMBLE --> COMPLETE{"All fragments?"}
+
+        COMPLETE -->|No| WAIT["Wait more fragments"]
+
+        COMPLETE -->|Yes| RESTORE["Reassemble payload"]
+
+        RESTORE --> EMIT_DIRECT
     end
 ```
 
 ### 5.2 Reliable Chunk Transfer
 
-For values larger than 900 bytes, a sliding window protocol ensures delivery:
+For values larger than 900 bytes (SYNC_CHUNK_SIZE), a sliding window protocol ensures delivery:
+
+Parameters:
+- **Window Size**: 8 chunks (WINDOW constant in `_onWant`)
+- **Chunk Size**: 900 bytes (`SYNC_CHUNK_SIZE`)
+- **RTO**: 1500ms (retransmit timeout)
+- **Safety Timeout**: 60 seconds (cleanup)
 
 ```mermaid
 sequenceDiagram
     participant S as Sender
     participant R as Receiver
     
-    S->>R: CHUNK (key=foo, idx=0, total=10) [chunk 0]
-    S->>R: CHUNK (key=foo, idx=1, total=10) [chunk 1]
-    S->>R: CHUNK (key=foo, idx=2, total=10) [chunk 2]
-    S->>R: CHUNK (key=foo, idx=3, total=10) [chunk 3]
-    S->>R: CHUNK (key=foo, idx=4, total=10) [chunk 4]
-    S->>R: CHUNK (key=foo, idx=5, total=10) [chunk 5]
-    S->>R: CHUNK (key=foo, idx=6, total=10) [chunk 6]
-    S->>R: CHUNK (key=foo, idx=7, total=10) [chunk 7]
+    loop Window of 8 chunks
+        S->>R: CHUNK (idx=N, total=M)
+    end
     
-    R-->>S: CHUNK_ACK (key=foo, idx=0)
-    R-->>S: CHUNK_ACK (key=foo, idx=1)
-    R-->>S: CHUNK_ACK (key=foo, idx=2)
+    loop ACKs received
+        R-->>S: CHUNK_ACK (idx=N)
+    end
     
-    Note over R: Reassemble chunks 0-N
+    S->>R: CHUNK (idx=N+8, ...)
+    R-->>S: CHUNK_ACK (idx=N+8)
     
-    S->>R: CHUNK (key=foo, idx=8, total=10)
-    S->>R: CHUNK (key=foo, idx=9, total=10)
-    
-    R-->>S: CHUNK_ACK (key=foo, idx=8)
-    R-->>S: CHUNK_ACK (key=foo, idx=9)
-    
-    Note over R: Transfer Complete
+    Note over R: All chunks received, reassemble
+    Note over S: Transfer complete
 ```
-
-Parameters:
-- **Window Size**: 8 chunks
-- **Chunk Size**: 900 bytes
-- **RTO**: 1500ms (retransmit timeout)
-- **Safety Timeout**: 60 seconds
 
 ---
 
 ## 6. NAT Traversal
 
-### 6.1 NAT Type Detection
+### 6.1 STUN Probe
+
+The code uses multiple STUN servers to detect NAT type:
 
 ```mermaid
 flowchart TD
-    START[Start STUN Probe] --> STUN1[Send STUN Request]
-    STUN1 --> RESP1{Response?}
+    START[_stunLazy] --> PROBES[Map STUN servers]
+    PROBES --> RACE[Promise.race]
+    RACE --> GOT{first response?}
     
-    RESP1 -->|No| RETRY[Retry in 3s]
+    GOT -->|No| RETRY[Retry in 3s]
     RETRY --> START
     
-    RESP1 -->|Yes| EXTRACT[Extract External IP:Port]
-    EXTRACT --> MULTI[Probe Multiple STUN Servers]
-    MULTI --> COMPARE{Same IP:Port from 2+ servers?}
+    GOT -->|Yes| EXTRACT[Extract IP:Port]
+    EXTRACT --> ALL[Promise.all probes]
+    ALL --> CHECK{2+ same IP?}
     
-    COMPARE -->|No| RESTRICTED[Restricted Cone NAT]
-    COMPARE -->|Yes| TEST_PORT[Test Port Preservation]
+    CHECK -->|No| UNKNOWN[unknown nat]
+    CHECK -->|Yes| COMPARE{2+ same port?}
     
-    TEST_PORT -->|Same Port| FULL_CONE[Full-Cone NAT]
-    TEST_PORT -->|Different Port| RESTRICTED
+    COMPARE -->|Yes| FULL[Full-cone NAT]
+    COMPARE -->|No| RESTRICTED[Restricted cone]
     
-    FULL_CONE --> READY[Ready - Can Relay]
-    RESTRICTED --> READY
+    FULL --> RELAY{relay enabled?}
+    RESTRICTED --> RELAY
+    UNKNOWN --> RELAY
+    
+    RELAY -->|_announceRelay_| DONE[_isRelay = true]
 ```
 
-### 6.2 Relay Mechanism
+STUN servers used (from constants.js):
+- `stun.l.google.com:19302`
+- `stun1.l.google.com:19302`
+- `stun2.l.google.com:19302`
+- `stun.cloudflare.com:3478`
+- `stun.stunprotocol.org:3478`
+- `global.stun.twilio.com:3478`
+- `stun.ekiga.net:3478`
 
-Peers with full-cone NAT automatically become relays for others:
+### 6.2 NAT Types Detected
+
+| Type | Detection | Can Relay? |
+|---|---|---|
+| `full_cone` | Same external IP:Port from 2+ STUN servers | Yes |
+| `restricted_cone` | Same IP but different port | No |
+| `unknown` | Single response | No |
+
+### 6.3 Relay Mechanism
+
+Peers with full-cone NAT become relays automatically (swarm.js `_checkBecomeRelay`):
 
 ```mermaid
 flowchart LR
-    A[Peer A<br/>Full-Cone NAT] -->|Announce Relay| B[Peer B]
-    C[Peer C<br/>Symmetric NAT] -->|Request Introduction| B
-    B -->|Forward Request| A
-    A -->|Relay Introduction| C
+    A["Peer A<br/>full_cone NAT"] -->|_announceRelay| ANNOUNCE[ advertise]
+    ANNOUNCE --> B["Peer B"]
+    C["Peer C<br/>symmetric NAT"] -->|REQ| RELAY[Relay Request]
+    RELAY --> B
+    B -->|FORWARD| A
+    A -->|INTRODUCE| C
 ```
 
 ---
 
 ## 7. Mesh Management
 
-### 7.1 Flooding Mesh
+### 7.1 Mesh Degree
 
-```mermaid
-flowchart TB
-    subgraph "Gossip/IHave Protocol"
-    PEER1[Peer 1] -->|IHAVE keys| PEER2
-    PEER1 -->|IHAVE keys| PEER3
-    PEER1 -->|IHAVE keys| PEER4
-    
-    PEER2 -->|WANT key| PEER1
-    PEER3 -->|WANT key| PEER1
-    PEER4 -->|WANT key| PEER1
-    
-    PEER1 -->|CHUNK key| PEER2
-    PEER1 -->|CHUNK key| PEER3
-    PEER1 -->|CHUNK key| PEER4
-    end
-```
+The mesh maintains a target number of "mesh peers" for gossip flooding.
 
-### 7.2 Mesh Degree Adaptation
+| Constant | Default | Description |
+|---|---|---|
+| `D_DEFAULT` | 6 | Default mesh degree |
+| `D_MIN` | 4 | Minimum mesh degree |
+| `D_MAX` | 16 | Maximum mesh degree |
+| `D_LOW` | 4 | Low threshold (add peers) |
+| `D_HIGH` | 16 | High threshold (remove peers) |
 
-The mesh degree (D) adapts based on RTT:
+### 7.2 Mesh Adaptation
 
 ```mermaid
 flowchart TD
-    START[Heartbeat] --> CALC_AVG[Calculate Average RTT]
-    CALC_AVG --> CHECK{RTT > 200ms?}
-    
-    CHECK -->|Yes| DECREASE[D--]
-    CHECK -->|No| CHECK_LOW{RTT < 50ms?}
-    
-    CHECK_LOW -->|Yes| INCREASE[D++]
-    CHECK_LOW -->|No| MAINTAIN[Maintain D]
-    
-    DECREASE -->|D > D_MIN| APPLY[Apply Change]
-    INCREASE -->|D < D_MAX| APPLY
-    MAINTAIN --> APPLY
-    APPLY --> DONE
-```
 
-Mesh parameters:
-- **Default Degree (D_DEFAULT)**: 6
-- **Minimum Degree (D_MIN)**: 4
-- **Maximum Degree (D_MAX)**: 16
-- **Low Threshold (D_LOW)**: 4
-- **High Threshold (D_HIGH)**: 16
+    HEARTBEAT["Heartbeat interval (1s)"]
+
+    HEARTBEAT --> PEERS{"Mesh peers available?"}
+
+    PEERS -->|No| EXIT["Skip adaptation"]
+
+    PEERS -->|Yes| RTT["Calculate average RTT"]
+
+    RTT --> HIGH{"avg RTT > 200ms?"}
+
+    HIGH -->|Yes| DEC["Decrease mesh degree"]
+
+    HIGH -->|No| LOW{"avg RTT < 50ms?"}
+
+    LOW -->|Yes| INC_CHECK{"D < D_MAX?"}
+
+    LOW -->|No| KEEP["Keep current D"]
+
+    INC_CHECK -->|Yes| INC["Increase mesh degree"]
+
+    INC_CHECK -->|No| KEEP
+
+    DEC --> MIN_CHECK{"D > D_MIN?"}
+
+    MIN_CHECK -->|Yes| APPLY_DEC["Apply D = D - 1"]
+
+    MIN_CHECK -->|No| KEEP
+
+    INC --> APPLY_INC["Apply D = D + 1"]
+
+    APPLY_INC --> REBALANCE["Rebalance mesh"]
+
+    APPLY_DEC --> REBALANCE
+
+    KEEP --> REBALANCE
+
+    REBALANCE --> ADD_CHECK{"Mesh peers < D_LOW?"}
+
+    ADD_CHECK -->|Yes| ADD["Promote peers into mesh"]
+
+    ADD_CHECK -->|No| REMOVE_CHECK{"Mesh peers > D_HIGH?"}
+
+    REMOVE_CHECK -->|Yes| REMOVE["Remove excess peers"]
+
+    REMOVE_CHECK -->|No| END["Mesh stable"]
+
+    ADD --> END
+
+    REMOVE --> END
+```
 
 ---
 
 ## 8. Cryptography
 
-### 8.1 Key Derivation
+### 8.1 Implementation (NOT in constants.js - inline in crypto.js)
+
+**X25519 Key Generation:**
+```javascript
+// crypto.js line 19
+const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
+```
+
+**Session Key Derivation:**
+```javascript
+// crypto.js line 31-33
+const derived = Buffer.from(
+  crypto.hkdfSync('sha256', shared, Buffer.alloc(0), Buffer.from('p2p-v12-session'), 68)
+);
+```
+
+**ChaCha20-Poly1305:**
+```javascript
+// crypto.js line 47
+const cipher = crypto.createCipheriv('chacha20-poly1305', sess.sendKey, nonce, { authTagLength: 16 });
+```
+
+### 8.2 Key Derivation Flow
 
 ```mermaid
 flowchart LR
-    A[Generate X25519<br/>Key Pair] --> SHARED[ECDH Shared Secret]
-    B[Peer B Public Key] --> SHARED
-    
+    A["my X25519<br/>private key"] --> ECDH[ECDH]
+    B["their X25519<br/>public key"] --> ECDH
+    ECDH --> SHARED[shared secret]
     SHARED --> HKDF[HKDF-SHA256]
-    HKDF -->|"label=p2p-v12-session"| KEYS[Derive Keys]
-    
-    KEYS -->|0-31| SEND_KEY[Send Key]
-    KEYS -->|32-63| RECV_KEY[Receive Key]
-    KEYS -->|64-67| SESSION_ID[Session ID]
-```
-
-### 8.2 Encryption
-
-```
-Algorithm: ChaCha20-Poly1305
-Key: 32 bytes
-Nonce: 12 bytes (4-byte session ID + 8-byte counter)
-Auth Tag: 16 bytes
+    HKDF -->|"label=p2p-v12-session"| KEYS[68 bytes]
+    KEYS --> SEND[bytes 0-31<br/>send key]
+    KEYS --> RECV[bytes 32-63<br/>recv key]
+    KEYS --> SID[bytes 64-67<br/>session ID]
 ```
 
 ---
@@ -404,211 +610,304 @@ Auth Tag: 16 bytes
 
 ### 9.1 Bloom Filter
 
-Used for duplicate detection in message flooding:
+Used for duplicate detection in message flooding (line 92 in swarm.js):
 
-- **Size**: 64 megabits
+- **Size**: `BLOOM_BITS = 64 * 1024 * 1024` = **8,388,608 bits (1 MB)**
 - **Hash Functions**: 5
-- **Rotation Interval**: 5 minutes
+- **Rotation**: Every 5 minutes (`BLOOM_ROTATE`)
 
-```mermaid
-flowchart LR
-    MSG[Incoming Message] --> HASH[Hash to 8-byte key]
-    HASH --> CHECK{Check Bloom Filter?}
-    
-    CHECK -->|Seen| DROP[Drop Duplicate]
-    CHECK -->|New| ADD[Add to Bloom]
-    ADD --> FORWARD[Forward to Mesh]
+> **CORRECTION**: Spec incorrectly said "64 megabits" - actually it's 1 megabyte = 8 megabits
+
+```javascript
+// structs.js line 6-12
+class BloomFilter {
+  constructor(bits, numHashes) {
+    this._bits = bits || BLOOM_BITS;  // 8,388,608
+    this._hashes = numHashes || 5;
 ```
 
 ### 9.2 LRU Cache
 
-Used for key-value storage:
+Multiple uses:
 
-- **Default Size**: 10,000 entries
-- **TTL**: Configurable (default: infinity for storage, 30s for gossip)
+- **`_store`**: Key-value cache (swarm.js line 102) - max 10,000 entries
+- **`_gossipSeen`**: Gossip deduplication (swarm.js line 94) - 200,000 entries, 30s TTL
 
 ### 9.3 Ring Buffer
 
-Used for per-peer send queues:
+Per-peer queues (structs.js line 83-111):
 
-- **Control Queue**: 256 items
-- **Data Queue**: 2048 items
-- **Size**: Power of 2
+- **Control Queue**: 256 items (`QUEUE_CTRL`)
+- **Data Queue**: 2048 items (`QUEUE_DATA`)
+- **Size**: Must be power of 2
+
+### 9.4 Payload Cache
+
+Caches recent encrypted messages for jitter buffer processing (swarm.js line 100):
+
+```javascript
+this._payloadCache = new PayloadCache(8192);
+```
 
 ---
 
 ## 10. Component Interactions
 
-### 10.1 Peer State Machine
+### 10.1 Peer State
 
-```mermaid
-stateDiagram-v2
-    [*] --> DIALING: Dial initiated
-    DIALING --> HANDSHAKE: Hello sent
-    HANDSHAKE --> CONNECTED: HelloAck received
-    CONNECTED --> ESTABLISHED: Session derived
-    ESTABLISHED --> ACTIVE: First data sent
-    ACTIVE --> DEGRADING: No pong for 5s
-    DEGRADING --> TIMEOUT: No pong for 60s
-    TIMEOUT --> [*]: Disconnect
-    
-    DEGRADING --> ACTIVE: Pong received
-    ACTIVE --> DEGRADING: Packet loss detected
-```
+States tracked in Peer class:
+
+- `_open`: Connection open (default: `true`)
+- `inMesh`: Part of mesh (default: `false`)
+- `_seen`: Last activity timestamp
+- `_lastPong`: Last pong received timestamp
 
 ### 10.2 Congestion Control
 
 ```mermaid
 flowchart TB
-    START[Send Data] --> CWND{CWND Check}
-    
-    CWND -->|inflight < CWND| ENCRYPT[Encrypt & Send]
-    CWND -->|inflight >= CWND| QUEUE[Queue]
-    
-    ENCRYPT --> ACK{ACK Received?}
-    ACK -->|Yes| INCREASE[CWND + 1]
-    ACK -->|No| TIMEOUT[Retransmit]
-    
-    TIMEOUT --> DECAY[CWND * 0.75]
-    INCREASE -->|CWND < CWND_MAX| LIMIT[Cap at CWND_MAX]
-    
-    QUEUE --> ENCRYPT
-    DECAY --> ENCRYPT
-    LIMIT --> ENCRYPT
+    SEND[_sendEncrypted] --> TOKEN{Token bucket check}
+    TOKEN -->|No| QUEUE[Rate limited]
+    TOKEN -->|Yes| CWND{cwnd check}
+    CWND -->|No| QUEUE
+    CWND -->|Yes| SEND_ENC[Encrypt]
+    SEND_ENC --> INFLIGHT[inflight++]
+    INFLIGHT --> ACK{ack received?}
+    ACK -->|Yes| CND_INCREASE[cwnd++]
+    ACK -->|No| TIMEOUT[timeout]
+    TIMEOUT --> CND_DECAY[cwnd *= 0.75]
+    CND_INCREASE --> CWND_MAX[cwnd cap 512]
 ```
 
 ---
 
-## 11. API Architecture
+## 11. API
 
-### 11.1 Class Diagram
+### 11.1 Swarm Options
 
-```mermaid
-classDiagram
-    class Swarm {
-        +new Swarm(opts?)
-        +join(topic, opts?)
-        +broadcast(data)
-        +store(key, value)
-        +fetch(key, timeout?)
-        +destroy()
-        +on(event, handler)
-        +peers: Peer[]
-        +size: number
-        +meshPeers: Peer[]
-    }
-    class Peer {
-        +id: string
-        +write(data)
-        +writeCtrl(data)
-        +on(event, handler)
-    }
-    
-    Swarm --> Peer: creates
+| Option | Default | Type | Description |
+|---|---|---|---|
+| `seed` | random | string | 32-byte hex for deterministic identity |
+| `maxPeers` | 100 | number | Max simultaneous connections |
+| `relay` | false | boolean | Force relay mode |
+| `bootstrap` | [] | array | `["host:port"]` UDP bootstrap nodes |
+| `bootstrapHttp` | [] | array | `["https://..."]` HTTP bootstrap URLs |
+| `seeds` | [] | array | Hardcoded seed peers |
+| `pipingServers` | [] | array | Piping server hostnames |
+| `exclusivePiping` | false | boolean | Use only provided piping servers |
+| `storage` | null | object | `{ get(), set() }` backend |
+| `storeCacheMax` | 10000 | number | Max LRU cache entries |
+| `onSavePeers` | null | function | `(peers) => {}` callback |
+| `onLoadPeers` | null | function | `() => peers` callback |
+
+> **CORRECTION**: `bootstrapHttp`, `pipingServers`, `exclusivePiping`, `storeCacheMax` were missing from spec
+
+### 11.2 Swarm Methods
+
+```javascript
+swarm.join(topic, opts?)          // Join topic
+  → { ready(), destroy() }
+
+swarm.broadcast(data)             // → number of peers
+swarm.store(key, value)        // Store locally + announce
+swarm.fetch(key, timeout?)     // → Promise<Buffer>
+swarm.destroy()                // → Promise<>
 ```
 
-### 11.2 Events
+### 11.3 Swarm Properties
+
+```javascript
+swarm.peers       // → Peer[]
+swarm.size       // → number
+swarm.meshPeers   // → Peer[] filtered by inMesh
+```
+
+### 11.4 Peer Methods
+
+```javascript
+peer.write(data)          // Enqueue encrypted data
+peer.writeCtrl(data)      // Enqueue control channel (unencrypted)
+peer.on('data', cb)      // Data event
+peer.on('open', cb)      // Connection opened
+peer.on('close', cb)     // Connection closed
+```
+
+> **CORRECTION**: `writeCtrl()` and Peer events were missing
+
+### 11.5 Events
 
 | Event | Arguments | Description |
 |---|---|---|
 | `connection` | `peer, info` | New peer connected |
 | `data` | `data, peer` | Message received |
-| `disconnect` | `peerId` | Peer disconnected |
+| `disconnect` | `peerId` | Peer dropped |
 | `sync` | `key, value` | Value received from network |
 | `nat` | — | Public address discovered |
 | `nattype` | — | NAT type determined |
-| `peers` | `peers[]` | Peer cache updated |
+| `peers` | `peers[]` | Peer cache emitted |
 | `close` | — | Swarm destroyed |
 
----
-
-## 12. Storage Backend
-
-### 12.1 Interface
-
-```typescript
-interface StorageBackend {
-  get(key: string): Promise<Buffer | null>;
-  set(key: string, value: Buffer): Promise<void>;
-}
-```
-
-### 12.2 Supported Backends
-
-- **LevelDB** (`level` package)
-- **SQLite** (`better-sqlite3`)
-- **JSON file** (simple key-value)
-- **Custom** (any async key-value store)
+> **CORRECTION**: `nattype`, `peers` events were missing from spec
 
 ---
 
-## 13. Constants Reference
+## 12. Constants
 
-### 13.1 Network
+### 12.1 Network
 
 | Constant | Default | Description |
 |---|---|---|
-| `MAX_PEERS` | 100 | Maximum simultaneous connections |
-| `MAX_PAYLOAD` | 1200 | Maximum payload size (bytes) |
-| `BATCH_MTU` | 1400 | Batch MTU threshold |
-| `PEER_TIMEOUT` | 60000 | Peer timeout (ms) |
-| `HEARTBEAT_MS` | 1000 | Heartbeat interval (ms) |
+| `MAX_PEERS` | 100 | Max simultaneous connections |
+| `MAX_PAYLOAD` | 1200 | Max payload before fragmentation |
+| `BATCH_MTU` | 1400 | Batch threshold |
+| `PEER_TIMEOUT` | 60,000 | Peer timeout (ms) |
+| `HEARTBEAT_MS` | 1,000 | Heartbeat interval |
 
-### 13.2 Discovery
+### 12.2 NAT/Traversal
 
 | Constant | Default | Description |
 |---|---|---|
 | `PUNCH_TRIES` | 8 | UDP punch attempts |
 | `PUNCH_INTERVAL` | 300 | Punch interval (ms) |
-| `ANNOUNCE_MS` | 18000 | Announcement interval (ms) |
-| `BOOTSTRAP_TIMEOUT` | 15000 | Bootstrap fallback delay (ms) |
+| `STUN_FAST_TIMEOUT` | 1,500 | STUN probe timeout |
+| `BOOTSTRAP_TIMEOUT` | 15,000 | Bootstrap fallback (ms) |
 
-### 13.3 Relay
-
-| Constant | Default | Description |
-|---|---|---|
-| `RELAY_MAX` | 20 | Maximum relays to track |
-| `RELAY_ANN_MS` | 30000 | Relay announcement interval |
-| `RELAY_BAN_MS` | 300000 | Relay ban duration |
-
-### 13.4 Sync
+### 12.3 Discovery
 
 | Constant | Default | Description |
 |---|---|---|
-| `SYNC_CHUNK_SIZE` | 900 | Chunk size for reliable transfer |
-| `SYNC_TIMEOUT` | 30000 | Fetch timeout (ms) |
-| `SYNC_CACHE_MAX` | 10000 | Cache size |
+| `ANNOUNCE_MS` | 18,000 | Announcement interval |
+| `PEX_MAX` | 20 | Max peers per PEX |
+| `PEX_INTERVAL` | 60,000 | PEX interval |
+| `MCAST_ADDR` | "239.0.0.1" | LAN multicast address |
+| `MCAST_PORT` | 45678 | LAN multicast port |
+| `F_LAN` | 0x09 | LAN frame type |
+
+### 12.4 Relay
+
+| Constant | Default | Description |
+|---|---|---|
+| `RELAY_MAX` | 20 | Max relays tracked |
+| `RELAY_ANN_MS` | 30,000 | Relay announcement |
+| `RELAY_BAN_MS` | 300,000 | Relay ban duration |
+| `RELAY_NAT_OPEN` | Set{`full_cone`, `open`} | NAT types that can relay |
+
+### 12.5 Sync/Storage
+
+| Constant | Default | Description |
+|---|---|---|
+| `SYNC_CHUNK_SIZE` | 900 | Chunk size |
+| `SYNC_TIMEOUT` | 30,000 | Fetch timeout |
+| `SYNC_CACHE_MAX` | 10,000 | Cache size |
 | `HAVE_BATCH` | 64 | HAVE batch size |
 
-### 13.5 Congestion Control
+### 12.6 Congestion
 
 | Constant | Default | Description |
 |---|---|---|
-| `CWND_INIT` | 16 | Initial congestion window |
-| `CWND_MAX` | 512 | Maximum congestion window |
-| `CWND_DECAY` | 0.75 | Window decay factor |
+| `CWND_INIT` | 16 | Initial cwnd |
+| `CWND_MAX` | 512 | Max cwnd |
+| `CWND_DECAY` | 0.75 | Decay on loss |
 | `RATE_PER_SEC` | 128 | Token bucket rate |
 | `RATE_BURST` | 256 | Token bucket burst |
+| `RTT_ALPHA` | 0.125 | RTT smoothing |
+| `RTT_INIT` | 100 | Initial RTT estimate |
 
-### 13.6 Protocol Frames
+### 12.7 Queues
+
+| Constant | Default | Description |
+|---|---|---|
+| `QUEUE_CTRL` | 256 | Control queue size |
+| `QUEUE_DATA` | 2,048 | Data queue size |
+
+### 12.8 Bloom/Gossip
+
+| Constant | Default | Description |
+|---|---|---|
+| `BLOOM_BITS` | 8,388,608 | Bloom filter bits |
+| `BLOOM_HASHES` | 5 | Hash functions |
+| `BLOOM_ROTATE` | 300,000 | Rotate interval |
+| `GOSSIP_MAX` | 200,000 | Gossip LRU size |
+| `GOSSIP_TTL` | 30,000 | Gossip TTL |
+| `IHAVE_MAX` | 200 | Max IHAVE buffer |
+
+### 12.9 Protocol Frames
 
 | Constant | Value | Description |
 |---|---|---|
 | `F_DATA` | 0x01 | Encrypted data |
-| `F_PING` | 0x03 | Keepalive request |
-| `F_PONG` | 0x04 | Keepalive response |
-| `F_FRAG` | 0x0B | Fragmented message |
+| `F_PING` | 0x03 | Keepalive |
+| `F_PONG` | 0x04 | Keepalive reply |
 | `F_GOAWAY` | 0x0A | Disconnect |
-| `F_BATCH` | 0x13 | Batch multiple frames |
-| `F_HAVE` | 0x10 | Announce available keys |
-| `F_WANT` | 0x11 | Request specific key |
-| `F_CHUNK` | 0x12 | Key value chunk |
-| `F_CHUNK_ACK` | 0x14 | Chunk acknowledgment |
-| `F_RELAY_ANN` | 0x20 | Relay announcement |
-| `F_RELAY_REQ` | 0x21 | Relay introduction request |
-| `F_RELAY_FWD` | 0x22 | Relay introduction forward |
-| `F_PEX` | 0x30 | Peer exchange |
+| `F_FRAG` | 0x0B | Fragment |
+| `F_BATCH` | 0x13 | Batch |
+| `F_HAVE` | 0x10 | Have keys |
+| `F_WANT` | 0x11 | Want key |
+| `F_CHUNK` | 0x12 | Chunk |
+| `F_CHUNK_ACK` | 0x14 | Chunk ACK |
 | `F_LAN` | 0x09 | LAN multicast |
+| `F_RELAY_ANN` | 0x20 | Relay announce |
+| `F_RELAY_REQ` | 0x21 | Relay request |
+| `F_RELAY_FWD` | 0x22 | Relay forward |
+| `F_PEX` | 0x30 | Peer exchange |
+
+### 12.10 Crypto
+
+| Constant | Default | Description |
+|---|---|---|
+| `TAG_LEN` | 16 | Poly1305 tag length |
+| `NONCE_LEN` | 12 | Nonce length |
+
+### 12.11 Misc
+
+| Constant | Default | Description |
+|---|---|---|
+| `DRAIN_TIMEOUT` | 2,000 | Drain timeout on close |
+| `FRAG_HDR` | 12 | Fragment header size |
+| `FRAG_DATA_MAX` | 1,188 | Max fragment data |
+| `FRAG_TIMEOUT` | 10,000 | Fragment assembly timeout |
+| `D_DEFAULT` | 6 | Mesh degree |
+| `D_MIN` | 4 | Min mesh degree |
+| `D_MAX` | 16 | Max mesh degree |
+| `D_LOW` | 4 | Low threshold |
+| `D_HIGH` | 16 | High threshold |
+| `D_GOSSIP` | 6 | Gossip targets |
+| `MAX_ADDRS_PEER` | 4 | Max addresses per peer |
+
+> **CORRECTION**: Many constants were missing - added all from constants.js
+
+---
+
+## 13. Discovery Strategies
+
+### 13.1 DHT
+
+- Topic-based discovery using Kademlia-like DHT
+- Keys: `topic:{topicHash}:{peerId}` and `relay:{topicHash}:{peerId}`
+- Values: JSON with `{ id, ip, port, lip, lport, nat }`
+
+### 13.2 HTTP Piping Servers
+
+Servers used (from constants.js):
+- `ppng.io`
+- `piping.nwtgck.org`
+- `piping.onrender.com`
+- `piping.glitch.me`
+
+### 13.3 HTTP Bootstrap
+
+Default servers (from constants.js):
+- `https://bootstrap-4eft.onrender.com`
+- `https://bootsrtap.firestarp.workers.dev`
+
+### 13.4 LAN Multicast
+
+- Address: 239.0.0.1:45678
+- Format in payload: `{id}:{localIP}:{localPort}:{topicHash}`
+
+### 13.5 Peer Cache
+
+In-memory cache loaded via `onLoadPeers` callback and emitted via `peers` event.
 
 ---
 
@@ -619,28 +918,21 @@ interface StorageBackend {
 ```javascript
 const swarm = new Swarm({
   storage: {
-    get: async (key) => { /* ... */ },
-    set: async (key, value) => { /* ... */ },
+    get: async (key) => { /* return Buffer or null */ },
+    set: async (key, value) => { /* persist */ },
   },
 });
 ```
 
-### 14.2 Custom Bootstrap
+### 14.2 Custom Bootstrap Nodes
 
 ```javascript
 const swarm = new Swarm({
-  bootstrap: ['bootstrap1.example.com:49737'],
-  seeds: ['seed1.example.com:49737'],
+  bootstrap: ['host1:49737', 'host2:49737'],
+  seeds: ['seed1:49737'],
   bootstrapHttp: ['https://bootstrap.example.com'],
-});
-```
-
-### 14.3 Peer Cache Callbacks
-
-```javascript
-const swarm = new Swarm({
-  onSavePeers: (peers) => saveToFile(peers),
-  onLoadPeers: () => loadFromFile(),
+  pipingServers: ['my-piping.example.com'],
+  exclusivePiping: true,
 });
 ```
 
@@ -648,24 +940,25 @@ const swarm = new Swarm({
 
 ## 15. Porting to Other Languages
 
-### 15.1 Minimum Required Implementation
+### 15.1 Minimum Implementation
 
-To port to another language, implement:
+To port, implement these IN ORDER:
 
-1. **X25519 key exchange** + HKDF-SHA256 to derive send/recv keys
-2. **ChaCha20-Poly1305** encrypt/decrypt with 12-byte nonce (4-byte session ID + 8-byte counter)
-3. **Handshake frames** (`0xA1` / `0xA2`)
-4. **DATA frame** (`0x01`) with encrypted payload
-5. **PING/PONG** for keepalive
+1. **X25519 key pair generation** (Node.js `crypto.generateKeyPairSync('x25519')`)
+2. **ECDH shared secret** (Node.js `crypto.diffieHellman()`)
+3. **HKDF-SHA256** key derivation with label `p2p-v12-session` producing 68 bytes
+4. **ChaCha20-Poly1305** with 12-byte nonce (first 4 bytes = session ID, last 8 = counter)
+5. **Handshake frames**: 0xA1 (HELLO) sends 8-byte ID + 32-byte public key
+6. **DATA frame**: 0x01 is encrypted payload with nonce + auth tag
+7. **PING (0x03)** and **PONG (0x04)** for keepalive
 
 ### 15.2 Optional Extensions
 
-Everything else is optional and can be added incrementally:
-
-- DHT for decentralized discovery
-- Relay for NAT traversal
-- PEX for peer exchange
-- Gossip for key propagation
+Can be added incrementally:
+- DHT discovery
+- Relay mechanism
+- Peer exchange
+- Gossip/IHave
 - Reliable chunk transfer
 
 ---
@@ -674,215 +967,174 @@ Everything else is optional and can be added incrementally:
 
 ```
 setowire/
-├── index.js       # Entry point (exports Swarm)
-├── swarm.js      # Main Swarm class (1318 lines)
-├── peer.js       # Per-peer state (207 lines)
-├── crypto.js     # X25519 + ChaCha20-Poly1305 (65 lines)
-├── dht_lib.js    # Minimal DHT implementation (365 lines)
+├── index.js        # Entry point (exports Swarm)
+├── swarm.js       # Main class (1318 lines)
+├── peer.js        # Peer state (207 lines)
+├── crypto.js      # X25519 + ChaCha20poly1305 (65 lines)
+├── dht_lib.js    # Simple DHT (365 lines)
 ├── framing.js    # Fragmentation, batching (161 lines)
-├── structs.js     # BloomFilter, LRU, RingBuffer (139 lines)
-├── constants.js  # All tuneable parameters (140 lines)
-├── chat.js       # Example terminal chat app
-├── package.json  # Package manifest
-└── README.md     # User documentation
+├── structs.js    # BloomFilter, LRU, RingBuffer (139 lines)
+├── constants.js  # All parameters (140 lines)
+├── chat.js      # Example CLI chat
+├── package.json # Package
+├── README.md    # User docs
+└── SPEC.md     # This specification
 ```
 
 ---
 
-## 17. Execution Flow (Startup)
+## 17. Execution Flow
 
 ```mermaid
 sequenceDiagram
-    participant App as Application
-    participant Swarm as Swarm
-    participant UDP as UDP Socket
-    participant STUN as STUN
-    participant DHT as DHT
-    participant Cache as Peer Cache
+    participant App as App
+    participant Swarm
+    participant UDP
+    participant STUN
+    participant DHT
+    participant Cache
     
     App->>Swarm: new Swarm(opts)
     Swarm->>Swarm: generateX25519()
-    Swarm->>Swarm: derivePeerId()
+    Swarm->>Swarm: _id = SHA256(pubKey)[:20]
+    
     Swarm->>UDP: bind(random port)
-    UDP-->>Swarm: port
+    UDP-->>Swarm: lport
     
-    Swarm->>STUN: probe()
-    STUN-->>Swarm: external IP:port
-    
-    Swarm->>DHT: start()
-    DHT-->>Swarm: ready
-    
-    Swarm->>Cache: load()
-    Cache-->>Swarm: peers
+    par STUN probes
+        Swarm->>STUN: probe multiple servers
+        STUN-->>Swarm: external IP:port
+    and DHT init
+        Swarm->>DHT: start()
+        DHT-->>Swarm: ready
+    and Load peers
+        Swarm->>Cache: call onLoadPeers
+    end
     
     Swarm->>Swarm: join(topic, opts)
     
-    Swarm->>DHT: announce(topic)
-    Swarm->>DHT: lookup(topic)
-    Swarm->>Swarm: postToPipingServers()
-    Swarm->>Swarm: queryHttpBootstrap()
-    Swarm->>Swarm: dialPeerCache()
-    Swarm->>Swarm: dialHardcodedSeeds()
-    Swarm->>Swarm: initLanMulticast()
+    par Parallel discovery
+        Swarm->>DHT: announce/lookup
+        Swarm->>Piping: POST announce
+        Swarm->>HTTP: query bootstrap
+        Swarm->>LAN: multicast
+        Swarm->>Cache: dial cached
+        Swarm->>Seeds: dial seeds
+    end
     
-    Note over Swarm: Ready for connections
-    Swarm->>App: emit('ready')
+    Swarm->>App: ready() resolves
+    note over Swarm: Now accepting connections
 ```
 
 ---
 
-## 18. Security Considerations
+## 18. Security
 
 ### 18.1 Encryption
 
-- **Key Exchange**: X25519 (Elliptic Curve Diffie-Hellman)
-- **Symmetric Encryption**: ChaCha20-Poly1305
-- **Key Derivation**: HKDF-SHA256 with fixed label
+- **Key Exchange**: X25519 (255-bit elliptic curve)
+- **Key Derivation**: HKDF-SHA256 (68 bytes from DH secret)
+- **Symmetric**: ChaCha20-Poly1305
+- **Nonce**: 12 bytes (4-byte session ID + 8-byte counter, big-endian)
 
-### 18.2 Denial of Service Mitigation
+### 18.2 Anti-DoS
 
-- Maximum peer limit (`maxPeers`)
-- Per-peer address limit (`MAX_ADDRS_PEER`)
-- Relay ban mechanism (`RELAY_BAN_MS`)
+- `maxPeers` limit (100)
+- `MAX_ADDRS_PEER` (4 addresses per peer)
+- Relay ban after failures
 - Token bucket rate limiting
 
-### 18.3 Relay Security
+---
 
-- Relays can be banned after failures
-- Relay announcement interval limits abuse
+## 19. Error Handling
+
+### 19.1 Connection Failures
+
+1. Try direct connection → failure
+2. Try via relay → failure
+3. Ban relay after 3 failures
+4. Emit `disconnect` event
+
+### 19.2 Storage Errors
+
+Silently ignored - data fetched from network fallback.
+
+### 19.3 Network Errors
+
+Socket errors caught and ignored.
 
 ---
 
-## 19. Performance Characteristics
+## Appendix A: Frame Details
 
-### 19.1 Latency
-
-- **Handshake**: 1-2 RTTs (typically 50-500ms)
-- **Message delivery**: ~1 RTT for direct peers
-- **NAT traversal**: +0-3 seconds for first connection
-
-### 19.2 Throughput
-
-- **Per peer**: Token bucket (128 tokens/sec, burst 256)
-- **Congestion window**: 16-512 packets
-- **Batch sender**: 1400 byte MTU
-
-### 19.3 Memory
-
-- **Per peer**: ~2KB (queues, state)
-- **Bloom filter**: 8MB
-- **LRU cache**: 10,000 entries
-
----
-
-## 20. Error Handling
-
-### 20.1 Connection Failures
-
-- NAT traversal failure → Try relay
-- Relay failure → Ban and select alternative
-- All strategies fail → Emit `disconnect` event
-
-### 20.2 Storage Errors
-
-- Storage backend errors → Silently ignored
-- Data fetched from network instead
-
-### 20.3 Network Errors
-
-- Socket errors → Logged and recovered
-- Invalid frames → Dropped silently
-
----
-
-## Appendix A: Protocol Buffer Formats
-
-### A.1 HELLO (0xA1)
+### A.1 HELLO (0xA1) - in constants.js? NO
 
 ```
-Offset  Size    Field
-0       1       Frame type (0xA1)
-1       8       Peer ID (20-byte SHA-256 truncated)
-9       32      X25519 public key
+Byte:  0       1       2-9      10-41
+Data:  0xA1    [8-byte peer ID] [32-byte X25519 pub]
 ```
 
-### A.2 DATA (0x01) - Encrypted
+### A.2 DATA (0x01)
 
 ```
-Offset  Size    Field
-0       1       Frame type (0x01)
-1       12      Nonce (session ID + counter)
-13      N       Ciphertext
-13+N    16      Auth tag
+Byte:  0       1-12    13-(13+N)  (13+N)-(29+N)
+Data:  0x01    [nonce] [ciphertext] [auth tag]
 ```
 
-### A.3 FRAG (0x0B)
+### A.3 IHAVE (0x07) - in constants.js? NO
 
 ```
-Offset  Size    Field
-0       1       Frame type (0x0B)
-1       8       Fragment ID (random)
-9       2       Fragment index
-11      2       Total fragments
-13      N       Fragment data
+Byte:  0       1-N*8    (N = number of keys)
+Data:  0x07    [key hashes]
 ```
 
-### A.4 BATCH (0x13)
+### A.4 PING (0x03)
 
 ```
-Offset  Size    Field
-0       1       Frame type (0x13)
-1       1       Frame count
-2       2       Frame 1 length
-4       L1      Frame 1 data
-4+L1    2       Frame 2 length
-...     ...     ...
+Byte:  0       1-8     9-16
+Data:  0x03    [timestamp] [peer ID]
 ```
 
 ---
 
-## Appendix B: Configuration Example
+## Appendix B: Events Not Documented Correctly
 
-```javascript
-const Swarm = require('setowire');
+| Event | Added | Description |
+|---|---|---|
+| `connection` | Yes | New peer |
+| `data` | Yes | Message |
+| `disconnect` | Yes | Peer left |
+| `sync` | Yes | Value received |
+| `nat` | Yes | Pub addr known |
+| `nattype` | **Added** | NAT type known |
+| `peers` | **Added** | Cache emitted |
+| `close` | Yes | Destroyed |
 
-const swarm = new Swarm({
-  seed: 'my-deterministic-seed-hex',
-  maxPeers: 100,
-  relay: false,
-  bootstrap: [
-    'bootstrap1.example.com:49737',
-    'bootstrap2.example.com:49737',
-  ],
-  seeds: [
-    'seed1.example.com:49737',
-  ],
-  storage: {
-    get: async (key) => { /* ... */ },
-    set: async (key, value) => { /* ... */ },
-  },
-  storeCacheMax: 10000,
-  onSavePeers: (peers) => { /* ... */ },
-  onLoadPeers: () => { /* ... */ },
-});
+Peer events (in peer.js):
 
-const topic = Buffer.from('my-topic');
+| Event | Description |
+|---|---|
+| `open` | Connection established |
+| `data` | Data received |
+| `close` | Connection closed |
 
-swarm.join(topic, { announce: true, lookup: true });
+---
 
-swarm.on('connection', (peer) => {
-  console.log('New peer:', peer.id);
-  peer.write(Buffer.from('Hello!'));
-});
+## Appendix C: Corrections Summary
 
-swarm.on('data', (data, peer) => {
-  console.log('Received:', data.toString());
-});
+This specification corrects the following errors from previous version:
 
-swarm.on('disconnect', (peerId) => {
-  console.log('Peer disconnected:', peerId);
-});
-```
+1. ~~Peer ID: 20 bytes~~ → Actually 8 bytes in HELLO frame (truncated)
+2. ~~Bloom size: 64 megabits~~ → Actually 8,388,608 bits (1 MB)
+3. ~~IHAVE frame~~ → Added (0x07, undocumented)
+4. ~~bootstrapHttp option~~ → Added to API table
+5. ~~pipingServers option~~ → Added to API table
+6. ~~storeCacheMax option~~ → Added to API table
+7. ~~writeCtrl method~~ → Added to Peer methods
+8. ~~nattype event~~ → Added to events table
+9. ~~peers event~~ → Added to events table
+10. ~~Peer 'open'/'close' events~~ → Added Peer events
+11. ~~All missing constants~~ → Added complete constants table
 
 ---
 
