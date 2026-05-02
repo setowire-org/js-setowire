@@ -53,11 +53,15 @@ const handshook = new Set();
 sys(`starting... nick=${nick} room=${room}`);
 
 swarm.join(topic, { announce: true, lookup: true }).ready().then(() => {
-  sys(`ready | nat=${swarm.natType} | addr=${swarm.publicAddress || 'LAN'}`);
+  const localPort = swarm._sock.address().port;
+  sys(`ready | nat=${swarm.natType} | addr=LAN | local=${localPort}`);
   iface.prompt(true);
 });
 
-swarm.on('nat',     () => sys(`nat=${swarm.natType} addr=${swarm.publicAddress || 'LAN'}`));
+swarm.on('nat',     () => {
+  const localPort = swarm._sock.address().port;
+  sys(`nat=${swarm.natType} addr=${swarm.publicAddress || 'LAN'} local=${localPort}`);
+});
 swarm.on('nattype', () => sys(`nat type refined: ${swarm.natType}`));
 
 swarm.on('connection', peer => {
