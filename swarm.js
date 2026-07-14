@@ -60,6 +60,11 @@ class Swarm extends EventEmitter {
     this._announcers = [];
     this._maxPeers   = opts.maxPeers || MAX_PEERS;
     this._diagnostics = createNetworkDiagnostics(opts.diagnostics);
+    this._pipingGetIdleMs = opts.pipingGetIdleMs || 30_000;
+    this._pipingGetDataMs = opts.pipingGetDataMs || 5_000;
+    this._pipingGetErrorMs = opts.pipingGetErrorMs || 10_000;
+    this._pipingGetMaxBytes = opts.pipingGetMaxBytes || 64 * 1024;
+    this._pipingSeen = new LRU(opts.pipingSeenMax || 4096, opts.pipingSeenTtl || 5 * 60_000);
 
     this._relays    = new Map();
     this._isRelay   = opts.relay === true;
@@ -148,6 +153,17 @@ async fetch(key, timeout = SYNC_TIMEOUT) {
     const inbox         = `/p2p-${topicHash}-${this._id}`;
     const me            = () => this._me();
     const timers        = [];
+    let stopped         = false;
+    const isStopped     = () => stopped || this._destroyed;
+    const defer         = (fn, ms) => {
+      const t = setTimeout(() => {
+        const idx = timers.indexOf(t);
+        if (idx !== -1) timers.splice(idx, 1);
+        if (!isStopped()) fn();
+      }, ms);
+      timers.push(t);
+      return t;
+    };
 
 const pipingPost = (host, path, body) => new Promise(resolve => {
       const buf = Buffer.from(JSON.stringify(body));
@@ -175,7 +191,13 @@ const pipingPost = (host, path, body) => new Promise(resolve => {
 
     const pipingGet = (host, path, cb) => {
       const loop = () => {
-        if (this._destroyed) return;
+        if (isStopped()) return;
+        let scheduled = false;
+        const schedule = (delay) => {
+          if (scheduled || isStopped()) return;
+          scheduled = true;
+          defer(loop, delay);
+        };
         this._diagnostics.recordSend({
           bytes: 0,
           type: `HTTP_GET ${path}`,
@@ -183,26 +205,49 @@ const pipingPost = (host, path, body) => new Promise(resolve => {
         });
         const req = https.request({ hostname: host, port: 443, path, method: 'GET' }, res => {
           let buf = '';
+          let bytes = 0;
+          let tooLarge = false;
           res.setEncoding('utf8');
           res.on('data', c => {
+            bytes += Buffer.byteLength(c);
             buf += c;
             this._diagnostics.recordReceive({
               bytes: Buffer.byteLength(c),
               type: `HTTP_GET_RESPONSE ${path}`,
               address: host,
             });
+            if (bytes > this._pipingGetMaxBytes) {
+              tooLarge = true;
+              req.destroy();
+              schedule(this._pipingGetIdleMs);
+            }
           });
           res.on('end', () => {
-            try { const d = JSON.parse(buf.trim()); if (d) cb(d); } catch {}
-            setTimeout(loop, 100);
+            if (tooLarge) return;
+            let acted = false;
+            try {
+              const d = JSON.parse(buf.trim());
+              if (d) acted = cb(d) === true;
+            } catch {}
+            schedule(acted ? this._pipingGetDataMs : this._pipingGetIdleMs);
           });
-          res.on('error', () => setTimeout(loop, 2000));
+          res.on('error', () => schedule(this._pipingGetErrorMs));
         });
-        req.on('error', () => setTimeout(loop, 2000));
-        req.setTimeout(120_000, () => req.destroy());
+        req.on('error', () => schedule(this._pipingGetErrorMs));
+        req.setTimeout(120_000, () => {
+          req.destroy();
+          schedule(this._pipingGetIdleMs);
+        });
         req.end();
       };
       loop();
+    };
+
+const acceptPipingInfo = (path, info) => {
+      if (!info?.id || info.id === this._id) return false;
+      const key = `${path}:${info.id}:${info.ip || ''}:${info.port || ''}:${info.lip || ''}:${info.lport || ''}`;
+      if (this._pipingSeen.seen(key)) return false;
+      return true;
     };
 
 const postAll = (path, body) => {
@@ -222,8 +267,8 @@ const dialBootstrapNode = (hostport) => {
 
 const scheduleBootstrapFallback = () => {
       if (!this._bootstrapNodes.length) return;
-      setTimeout(() => {
-        if (this._peers.size === 0 && !this._destroyed) {
+      defer(() => {
+        if (this._peers.size === 0 && !isStopped()) {
           this._bootstrapNodes.forEach(n => dialBootstrapNode(n));
         }
       }, BOOTSTRAP_TIMEOUT);
@@ -271,7 +316,7 @@ if (announce) {
             if (info.ip && info.port) this._meet(info);
           }
         };
-        setTimeout(doLookup, 1500);
+        defer(doLookup, 1500);
         const t = setInterval(doLookup, ANNOUNCE_MS);
         timers.push(t);
       }
@@ -289,10 +334,10 @@ this._queryBootstrapHttp();
 
 if (announce) {
         postAll(ANNOUNCE_PATH, me());
-        setTimeout(() => { if (!this._destroyed) postAll(ANNOUNCE_PATH, me()); }, 2_000);
-        setTimeout(() => { if (!this._destroyed) postAll(ANNOUNCE_PATH, me()); }, 5_000);
+        defer(() => postAll(ANNOUNCE_PATH, me()), 2_000);
+        defer(() => postAll(ANNOUNCE_PATH, me()), 5_000);
         const t = setInterval(() => {
-          if (this._destroyed) return clearInterval(t);
+          if (isStopped()) return clearInterval(t);
           postAll(ANNOUNCE_PATH, me());
         }, ANNOUNCE_MS);
         timers.push(t); this._announcers.push(t);
@@ -301,15 +346,17 @@ if (announce) {
       if (lookup) {
         this._pipingServers.forEach(host => {
           pipingGet(host, ANNOUNCE_PATH, info => {
-            if (!info?.id || info.id === this._id) return;
+            if (!acceptPipingInfo(ANNOUNCE_PATH, info)) return false;
             if (announce) postAll(`/p2p-${topicHash}-${info.id}`, me());
             if (info.ip && info.port) this._meet(info);
+            return true;
           });
         });
         this._pipingServers.forEach(host => {
           pipingGet(host, inbox, info => {
-            if (!info?.id || info.id === this._id) return;
+            if (!acceptPipingInfo(inbox, info)) return false;
             if (info.ip && info.port) this._meet(info);
+            return true;
           });
         });
       }
@@ -330,7 +377,17 @@ scheduleBootstrapFallback();
       }
     });
 
-    return { ready: () => this._ready, destroy: () => timers.forEach(t => clearInterval(t)) };
+    return {
+      ready: () => this._ready,
+      destroy: () => {
+        stopped = true;
+        timers.forEach(t => {
+          clearInterval(t);
+          clearTimeout(t);
+        });
+        timers.length = 0;
+      }
+    };
   }
 
   broadcast(data) {

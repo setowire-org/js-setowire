@@ -87,6 +87,11 @@ swarm.on('data', (data, peer) => {
 | `storeCacheMax` | 10000 | max entries kept in the in-memory cache |
 | `onSavePeers` | null | `(peers) => {}` called when the peer cache is updated |
 | `onLoadPeers` | null | `() => peers` called on startup to restore known peers |
+| `pipingGetIdleMs` | 30000 | delay before the next piping GET when no useful peer info was received |
+| `pipingGetDataMs` | 5000 | delay before the next piping GET after acting on new peer info |
+| `pipingGetErrorMs` | 10000 | retry delay after a piping GET error |
+| `pipingGetMaxBytes` | 65536 | max bytes accepted from one piping GET response before aborting it |
+| `pipingSeenTtl` | 300000 | dedupe window for repeated piping peer announcements |
 
 ### `swarm.join(topic, opts?)`
 
@@ -265,4 +270,3 @@ Commands: `/peers`, `/nat`, `/quit`
 ## License
 
 MIT
-
