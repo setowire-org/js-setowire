@@ -143,6 +143,7 @@ class SimpleDHT extends EventEmitter {
     this._pending = new Map();    
     this._sock    = null;
     this._ready   = false;
+    this._diagnostics = opts.diagnostics || null;
 
     this._startSocket();
     this._scheduleRepublish();
@@ -166,6 +167,11 @@ _startSocket() {
 
 _send(ip, port, msg) {
     const buf = encode(msg);
+    this._diagnostics?.recordSend?.({
+      bytes: buf.length,
+      type: `DHT_${msg.type || 'UNKNOWN'}`,
+      address: `${ip}:${port}`,
+    });
     this._sock.send(buf, 0, buf.length, port, ip, () => {});
   }
 
@@ -186,6 +192,11 @@ _send(ip, port, msg) {
   }
 
   _onMessage(buf, rinfo) {
+    this._diagnostics?.recordReceive?.({
+      bytes: buf.length,
+      type: 'DHT',
+      address: `${rinfo.address}:${rinfo.port}`,
+    });
     const msg = decode(buf);
     if (!msg) return;
 

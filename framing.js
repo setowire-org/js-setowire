@@ -103,10 +103,12 @@ function xorHash(buf) {
 }
 
 class BatchSender {
-  constructor(sock) {
+  constructor(sock, diagnostics = null, peerResolver = null) {
     this._sock    = sock;
     this._pending = new Map(); 
     this._timer   = null;
+    this._diagnostics = diagnostics;
+    this._peerResolver = peerResolver;
   }
 
   send(ip, port, buf) {
@@ -118,6 +120,7 @@ class BatchSender {
 
   sendNow(ip, port, buf) {
     
+    this._recordSend(ip, port, buf);
     try { this._sock.send(buf, 0, buf.length, +port, ip); } catch {}
   }
 
@@ -142,6 +145,7 @@ class BatchSender {
 
   _sendBatch(ip, port, bufs) {
     if (bufs.length === 1) {
+      this._recordSend(ip, port, bufs[0]);
       try { this._sock.send(bufs[0], 0, bufs[0].length, +port, ip); } catch {}
       return;
     }
@@ -152,7 +156,20 @@ class BatchSender {
       parts.push(lenBuf, b);
     }
     const out = Buffer.concat(parts);
+    this._recordSend(ip, port, out);
     try { this._sock.send(out, 0, out.length, +port, ip); } catch {}
+  }
+
+  _recordSend(ip, port, buf) {
+    if (!this._diagnostics?.enabled) return;
+    const address = `${ip}:${port}`;
+    const peerId = this._peerResolver ? this._peerResolver(address) : null;
+    this._diagnostics.recordSend({
+      bytes: buf.length,
+      type: this._diagnostics.frameName(buf, 'UDP_BATCH'),
+      peerId,
+      address,
+    });
   }
 
   destroy() { if (this._timer) { clearTimeout(this._timer); this._flush(); } }
