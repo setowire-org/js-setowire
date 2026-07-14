@@ -35,6 +35,7 @@ const { BloomFilter, LRU, PayloadCache } = require('./structs');
 const { generateX25519, deriveSession, decrypt } = require('./crypto');
 const { xorHash, BatchSender }                   = require('./framing');
 const Peer                                       = require('./peer');
+const { createNetworkDiagnostics }               = require('./diagnostics');
 
 function localIP() {
   for (const ifaces of Object.values(os.networkInterfaces()))
@@ -58,6 +59,7 @@ class Swarm extends EventEmitter {
     this._destroyed  = false;
     this._announcers = [];
     this._maxPeers   = opts.maxPeers || MAX_PEERS;
+    this._diagnostics = createNetworkDiagnostics(opts.diagnostics);
 
     this._relays    = new Map();
     this._isRelay   = opts.relay === true;
@@ -149,10 +151,23 @@ async fetch(key, timeout = SYNC_TIMEOUT) {
 
 const pipingPost = (host, path, body) => new Promise(resolve => {
       const buf = Buffer.from(JSON.stringify(body));
+      this._diagnostics.recordSend({
+        bytes: buf.length,
+        type: `HTTP_POST ${path}`,
+        address: host,
+      });
       const req = https.request({
         hostname: host, port: 443, path, method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': buf.length },
-      }, res => { res.resume(); resolve(true); });
+      }, res => {
+        res.on('data', c => this._diagnostics.recordReceive({
+          bytes: Buffer.byteLength(c),
+          type: `HTTP_POST_RESPONSE ${path}`,
+          address: host,
+        }));
+        res.resume();
+        resolve(true);
+      });
       req.on('error', () => resolve(false));
       req.setTimeout(8000, () => { req.destroy(); resolve(false); });
       req.write(buf); req.end();
@@ -161,10 +176,22 @@ const pipingPost = (host, path, body) => new Promise(resolve => {
     const pipingGet = (host, path, cb) => {
       const loop = () => {
         if (this._destroyed) return;
+        this._diagnostics.recordSend({
+          bytes: 0,
+          type: `HTTP_GET ${path}`,
+          address: host,
+        });
         const req = https.request({ hostname: host, port: 443, path, method: 'GET' }, res => {
           let buf = '';
           res.setEncoding('utf8');
-          res.on('data', c => { buf += c; });
+          res.on('data', c => {
+            buf += c;
+            this._diagnostics.recordReceive({
+              bytes: Buffer.byteLength(c),
+              type: `HTTP_GET_RESPONSE ${path}`,
+              address: host,
+            });
+          });
           res.on('end', () => {
             try { const d = JSON.parse(buf.trim()); if (d) cb(d); } catch {}
             setTimeout(loop, 100);
@@ -205,7 +232,7 @@ const scheduleBootstrapFallback = () => {
 const DHT_FALLBACK_MS = 12_000;
 
     const startDHT = async () => {
-      this._dht = new SimpleDHT({ port: 0 });
+      this._dht = new SimpleDHT({ port: 0, diagnostics: this._diagnostics });
       await this._dht.ready();
 
       if (this._bootstrapNodes.length) {
@@ -312,6 +339,7 @@ scheduleBootstrapFallback();
     for (const peer of this.peers) {
       if (peer._session && peer._open) { peer.write(raw); sent++; }
     }
+    this._diagnostics.recordBroadcast(sent);
     return sent;
   }
 
@@ -328,6 +356,7 @@ scheduleBootstrapFallback();
       setTimeout(() => {
         this._emitPeerCache();
         this._batch?.destroy();
+        this._diagnostics.close();
         try { this._sock?.close(); } catch {}
         try { this._mcastSock?.close(); } catch {}
         try { this._dht?.destroy(); } catch {}
@@ -343,7 +372,7 @@ async _init() {
     this._sock  = dgram.createSocket('udp4');
     await new Promise((ok, fail) => this._sock.bind(0, e => e ? fail(e) : ok()));
     this._lport = this._sock.address().port;
-    this._batch = new BatchSender(this._sock);
+    this._batch = new BatchSender(this._sock, this._diagnostics, addr => this._addrToId.get(addr) || null);
     this._sock.on('message', (buf, r) => this._recv(buf, r));
     this._sock.on('error', () => {});
     this._heartbeat();
@@ -352,6 +381,19 @@ async _init() {
     this._initPex();
     this._initPeerCacheEmit();
     setTimeout(() => this._queryBootstrapHttp(), 500);
+  }
+
+  _sendUdp(buf, port, ip, type = null) {
+    if (this._diagnostics.enabled) {
+      const address = `${ip}:${port}`;
+      this._diagnostics.recordSend({
+        bytes: buf.length,
+        type: type || this._diagnostics.frameName(buf, 'UDP'),
+        peerId: this._addrToId.get(address) || null,
+        address,
+      });
+    }
+    try { this._sock.send(buf, 0, buf.length, +port, ip); } catch {}
   }
 
   _stunLazy() {
@@ -418,7 +460,7 @@ async _init() {
       req.writeUInt16BE(0x0001, 0);
       req.writeUInt32BE(0x2112A442, 4);
       crypto.randomBytes(12).copy(req, 8);
-      try { this._sock.send(req, 0, req.length, server.port, server.host); } catch { resolve(null); }
+      this._sendUdp(req, server.port, server.host, 'STUN_BINDING');
     });
   }
 
@@ -441,15 +483,30 @@ async _init() {
       setInterval(() => {
         const tHash = this._topicHash || '';
         const msg = Buffer.from([F_LAN, ...Buffer.from(`${this._id}:${this._lip}:${this._lport}:${tHash}`)]);
+        if (this._diagnostics.enabled) {
+          this._diagnostics.recordSend({
+            bytes: msg.length,
+            type: 'LAN',
+            address: `${MCAST_ADDR}:${MCAST_PORT}`,
+          });
+        }
         try { this._mcastSock.send(msg, 0, msg.length, MCAST_PORT, MCAST_ADDR); } catch {}
       }, 5000);
     } catch {}
   }
 
-_recv(buf, r) {
+_recv(buf, r, batched = false) {
     if (buf.length < 2) return;
     const src  = `${r.address}:${r.port}`;
     const type = buf[0];
+    if (this._diagnostics.enabled) {
+      this._diagnostics.recordReceive({
+        bytes: batched ? 0 : buf.length,
+        type: this._diagnostics.frameName(buf, 'UDP'),
+        peerId: this._addrToId.get(src) || null,
+        address: src,
+      });
+    }
 
     if (type === 0xA1)   return this._onHello(buf, src);
     if (type === 0xA2)   return this._onHelloAck(buf, src);
@@ -477,7 +534,7 @@ _onBatch(buf, src) {
       if (off + 2 > buf.length) break;
       const len = buf.readUInt16BE(off); off += 2;
       if (off + len > buf.length) break;
-      this._recv(buf.slice(off, off + len), { address: src.split(':')[0], port: +src.split(':')[1] });
+      this._recv(buf.slice(off, off + len), { address: src.split(':')[0], port: +src.split(':')[1] }, true);
       off += len;
     }
   }
@@ -488,7 +545,7 @@ _sendHello(ip, port) {
     frame[0] = 0xA1;
     idBuf.copy(frame, 1);
     this._myX25519.pubRaw.copy(frame, 9);
-    try { this._sock.send(frame, 0, frame.length, +port, ip); } catch {}
+    this._sendUdp(frame, +port, ip, 'HELLO');
   }
 
   _sendHelloAck(ip, port) {
@@ -497,7 +554,7 @@ _sendHello(ip, port) {
     frame[0] = 0xA2;
     idBuf.copy(frame, 1);
     this._myX25519.pubRaw.copy(frame, 9);
-    try { this._sock.send(frame, 0, frame.length, +port, ip); } catch {}
+    this._sendUdp(frame, +port, ip, 'HELLO_ACK');
   }
 
   _onHello(buf, src) {
@@ -561,6 +618,7 @@ _sendHello(ip, port) {
     this._peers.set(pid, peer);
     this._addrToId.set(src, pid);
     this._dialing.delete(pid);
+    this._diagnostics.recordConnectionOpened();
     return true;
   }
 
@@ -632,7 +690,7 @@ if (plain.length > 0 && plain[0] === 0x7B) {
     const pong  = Buffer.allocUnsafe(1 + idBuf.length);
     pong[0] = F_PONG;
     idBuf.copy(pong, 1);
-    try { const [ip, port] = src.split(':'); this._sock.send(pong, 0, pong.length, +port, ip); } catch {}
+    try { const [ip, port] = src.split(':'); this._sendUdp(pong, +port, ip, 'PONG'); } catch {}
   }
 
   _onPong(buf, src) {
@@ -956,7 +1014,7 @@ _sendHaveSummary(peer) {
     frame[o++] = myIp.length;
     myIp.copy(frame, o); o += myIp.length;
     frame.writeUInt16BE(this._lport, o);
-    try { this._sock.send(frame, 0, frame.length, relay.port, relay.ip); } catch {}
+    this._sendUdp(frame, relay.port, relay.ip, 'RELAY_REQ');
     return true;
   }
 
@@ -1122,13 +1180,25 @@ _sendHaveSummary(peer) {
           port: announcePort,
         }));
         const announceUrl = new URL(base + '/announce');
+        this._diagnostics.recordSend({
+          bytes: body.length,
+          type: 'HTTP_BOOTSTRAP_ANNOUNCE',
+          address: announceUrl.host,
+        });
         const req = lib.request({
           hostname: announceUrl.hostname,
           port:     announceUrl.port || (base.startsWith('https') ? 443 : 80),
           path:     '/announce',
           method:   'POST',
           headers:  { 'Content-Type': 'application/json', 'Content-Length': body.length },
-        }, (res) => { res.resume(); });
+        }, (res) => {
+          res.on('data', c => this._diagnostics.recordReceive({
+            bytes: Buffer.byteLength(c),
+            type: 'HTTP_BOOTSTRAP_ANNOUNCE_RESPONSE',
+            address: announceUrl.host,
+          }));
+          res.resume();
+        });
         req.on('error', () => {});
         req.setTimeout(8000, () => req.destroy());
         req.write(body);
@@ -1136,10 +1206,22 @@ _sendHaveSummary(peer) {
       }
 
       const peersUrl = base + '/peers';
+      this._diagnostics.recordSend({
+        bytes: 0,
+        type: 'HTTP_BOOTSTRAP_PEERS',
+        address: new URL(peersUrl).host,
+      });
       const req2 = lib.get(peersUrl, (res) => {
         let buf = '';
         res.setEncoding('utf8');
-        res.on('data', c => { buf += c; });
+        res.on('data', c => {
+          buf += c;
+          this._diagnostics.recordReceive({
+            bytes: Buffer.byteLength(c),
+            type: 'HTTP_BOOTSTRAP_PEERS_RESPONSE',
+            address: new URL(peersUrl).host,
+          });
+        });
         res.on('end', () => {
           try {
             const list = JSON.parse(buf);
@@ -1212,7 +1294,7 @@ _sendHaveSummary(peer) {
         idBuf2.copy(ping, 9);
         peer._lastPingSent = now2;
         const [ip, port] = peer._best.split(':');
-        try { this._sock.send(ping, 0, ping.length, +port, ip); } catch {}
+        this._sendUdp(ping, +port, ip, 'PING');
       });
     }, HEARTBEAT_MS);
   }
@@ -1275,6 +1357,9 @@ _sendHaveSummary(peer) {
     const key = id || `${ip}:${port}`;
     if (this._dialing.has(key)) return;
     if (id && this._peers.has(id)) return;
+    const addr = `${ip}:${port}`;
+    const reconnect = this._peerCache.has(addr) || (id && [...this._peerCache.values()].some(p => p.id === id));
+    this._diagnostics.recordConnectionAttempt({ reconnect });
     this._dialing.add(key);
     for (let i = 0; i < PUNCH_TRIES; i++)
       setTimeout(() => this._sendHello(ip, port), i * PUNCH_INTERVAL);
@@ -1315,4 +1400,3 @@ _sendHaveSummary(peer) {
 }
 
 module.exports = Swarm;
-
