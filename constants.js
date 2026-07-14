@@ -4,7 +4,6 @@ const PIPING_SERVERS = [
   'ppng.io',
   'piping.nwtgck.org',
   'piping.onrender.com',
-  'piping.glitch.me',
 ];
 
 const STUN_HOSTS = [
